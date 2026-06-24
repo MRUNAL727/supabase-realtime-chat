@@ -2,7 +2,7 @@
 import z from "zod";
 import {createRoomSchema} from "@/services/supabase/schemas/rooms";
 import {getCurrentUser} from "@/services/supabase/lib/getCurrentUser";
-import {createClient} from "@/services/supabase/server";
+import {createAdminClient, createClient} from "@/services/supabase/server";
 import {redirect} from "next/navigation";
 
 
@@ -25,7 +25,7 @@ export async function createRoom(unsafeData: z.infer<typeof  createRoomSchema>) 
         }
     }
 
-    const supabase = await createClient();
+    const supabase = await createAdminClient();
 
     const { data: room, error: roomError } = await supabase
         .from('chat_room')

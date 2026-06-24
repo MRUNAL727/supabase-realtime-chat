@@ -1,0 +1,159 @@
+---
+description: Supabase Postgres RLS policies, schema conventions, and performance patterns
+globs: supabase/**,**/*.sql,services/supabase/types/**
+alwaysApply: false
+---
+
+# Database (Supabase Postgres)
+
+RLS and schema guidance for this chat app.
+
+**Tables:** `chat_room`, `chat_room_member`, `message`, `user_profile`, `realtime.messages`
+
+## Writing RLS Policies
+
+- Output only `CREATE POLICY` or `ALTER POLICY` statements in SQL blocks
+- Use `(select auth.uid())` instead of bare `auth.uid()` for performance
+- Always specify `TO authenticated` or `TO anon` — never omit roles
+- Correct clause order: `ON table FOR operation TO role USING/WITH CHECK`
+- Never use `FOR ALL` — create separate SELECT, INSERT, UPDATE, DELETE policies
+- SELECT: `USING` only | INSERT: `WITH CHECK` only | DELETE: `USING` only
+- UPDATE: both `USING` and `WITH CHECK`
+- Use double quotes for policy names; escape apostrophes in strings (`'Night''s watch'`)
+- Prefer **PERMISSIVE** (default) over **RESTRICTIVE** — permissive policies OR together; restrictive AND together and are harder to reason about
+- No inline SQL comments in generated policy SQL — put explanations outside the block
+
+## Performance
+
+- Index columns referenced in policies (not already PK/FK indexed)
+- Avoid joins in policies — use `IN (SELECT … WHERE user_id = (select auth.uid()))` instead
+- `chat_room_member` PK is `(member_id, chat_room_id)` — covers membership lookups
+- Add `message(chat_room_id)` index for per-room message queries
+
+## Access Model
+
+| Table | Rule |
+| ----- | ---- |
+| `user_profile` | All authenticated read; users insert/update own row (`id = auth.uid()`) |
+| `chat_room` | Public rooms or member rooms readable; any auth user creates; members update/delete |
+| `chat_room_member` | Users see own memberships; self-join public rooms; self-delete to leave |
+| `message` | Members read/send in their rooms; `author_id` must equal `auth.uid()` on insert |
+| `realtime.messages` | Members SELECT broadcasts on `room:{chat_room_id}:messages` topics |
+
+Room creation via admin/service role bypasses RLS for initial membership insert.
+
+## Reference Policies
+
+```sql
+CREATE POLICY "Authenticated users can view all user profiles." ON user_profile
+  FOR SELECT TO authenticated
+  USING (true);
+
+CREATE POLICY "Users can create their own profile." ON user_profile
+  FOR INSERT TO authenticated
+  WITH CHECK ((select auth.uid()) = id);
+
+CREATE POLICY "Users can update their own profile." ON user_profile
+  FOR UPDATE TO authenticated
+  USING ((select auth.uid()) = id)
+  WITH CHECK ((select auth.uid()) = id);
+
+CREATE POLICY "Authenticated users can view public rooms or rooms they belong to." ON chat_room
+  FOR SELECT TO authenticated
+  USING (
+    is_public = true
+    OR id IN (
+      SELECT chat_room_id FROM chat_room_member
+      WHERE member_id = (select auth.uid())
+    )
+  );
+
+CREATE POLICY "Authenticated users can create chat rooms." ON chat_room
+  FOR INSERT TO authenticated
+  WITH CHECK (true);
+
+CREATE POLICY "Room members can update their chat rooms." ON chat_room
+  FOR UPDATE TO authenticated
+  USING (
+    id IN (
+      SELECT chat_room_id FROM chat_room_member
+      WHERE member_id = (select auth.uid())
+    )
+  )
+  WITH CHECK (
+    id IN (
+      SELECT chat_room_id FROM chat_room_member
+      WHERE member_id = (select auth.uid())
+    )
+  );
+
+CREATE POLICY "Room members can delete their chat rooms." ON chat_room
+  FOR DELETE TO authenticated
+  USING (
+    id IN (
+      SELECT chat_room_id FROM chat_room_member
+      WHERE member_id = (select auth.uid())
+    )
+  );
+
+CREATE POLICY "Users can view their own room memberships." ON chat_room_member
+  FOR SELECT TO authenticated
+  USING (member_id = (select auth.uid()));
+
+CREATE POLICY "Users can join public rooms or add themselves as members." ON chat_room_member
+  FOR INSERT TO authenticated
+  WITH CHECK (
+    member_id = (select auth.uid())
+    AND (
+      EXISTS (
+        SELECT 1 FROM chat_room
+        WHERE id = chat_room_id AND is_public = true
+      )
+      OR EXISTS (
+        SELECT 1 FROM chat_room_member AS existing
+        WHERE existing.chat_room_id = chat_room_id
+          AND existing.member_id = (select auth.uid())
+      )
+    )
+  );
+
+CREATE POLICY "Users can leave rooms by removing their own membership." ON chat_room_member
+  FOR DELETE TO authenticated
+  USING (member_id = (select auth.uid()));
+
+CREATE POLICY "Room members can view messages in their rooms." ON message
+  FOR SELECT TO authenticated
+  USING (
+    chat_room_id IN (
+      SELECT chat_room_id FROM chat_room_member
+      WHERE member_id = (select auth.uid())
+    )
+  );
+
+CREATE POLICY "Room members can send messages as themselves." ON message
+  FOR INSERT TO authenticated
+  WITH CHECK (
+    author_id = (select auth.uid())
+    AND chat_room_id IN (
+      SELECT chat_room_id FROM chat_room_member
+      WHERE member_id = (select auth.uid())
+    )
+  );
+
+CREATE POLICY "Room members can receive message broadcasts for their rooms." ON realtime.messages
+  FOR SELECT TO authenticated
+  USING (
+    topic LIKE 'room:%:messages'
+    AND EXISTS (
+      SELECT 1 FROM chat_room_member
+      WHERE member_id = (select auth.uid())
+        AND chat_room_id = SPLIT_PART(topic, ':', 2)::uuid
+    )
+  );
+```
+
+## Migrations
+
+- Use `apply_migration` for DDL (policies, triggers, indexes)
+- Store local migrations in `supabase/migrations/`
+- Regenerate types after schema changes: `npm run gen-types`

@@ -1,0 +1,249 @@
+---
+description: Supabase Postgres functions and triggers — security, search_path, and chat app patterns
+globs: supabase/**,**/*.sql
+alwaysApply: false
+---
+
+# Database Functions
+
+PostgreSQL function and trigger guidance for this chat app.
+
+**Tables:** `chat_room`, `chat_room_member`, `message`, `user_profile`
+
+## General Rules
+
+1. Default to `SECURITY INVOKER` — runs with caller permissions
+2. Use `SECURITY DEFINER` only when required (e.g. `realtime.broadcast_changes`, bypassing RLS for system tasks) — always explain why
+3. Always `SET search_path = ''` and use fully qualified names (`public.message`, `auth.users`)
+4. Use explicit input/output types
+5. Prefer `IMMUTABLE` or `STABLE`; use `VOLATILE` for data-modifying functions and triggers
+6. Minimize side effects — prefer returning results unless the function is a trigger
+7. Triggers must include a valid `CREATE TRIGGER` statement alongside the function
+
+## Templates
+
+### Simple invoker function
+
+```sql
+CREATE OR REPLACE FUNCTION public.hello_world()
+RETURNS text
+LANGUAGE plpgsql
+SECURITY INVOKER
+SET search_path = ''
+AS $$
+BEGIN
+  RETURN 'hello world';
+END;
+$$;
+```
+
+### Parameterized query with qualified names
+
+```sql
+CREATE OR REPLACE FUNCTION public.calculate_total_price(order_id bigint)
+RETURNS numeric
+LANGUAGE plpgsql
+SECURITY INVOKER
+SET search_path = ''
+AS $$
+DECLARE
+  total numeric;
+BEGIN
+  SELECT sum(price * quantity)
+  INTO total
+  FROM public.order_items
+  WHERE order_id = calculate_total_price.order_id;
+
+  RETURN total;
+END;
+$$;
+```
+
+### Trigger function
+
+```sql
+CREATE OR REPLACE FUNCTION public.update_updated_at()
+RETURNS trigger
+LANGUAGE plpgsql
+SECURITY INVOKER
+SET search_path = ''
+AS $$
+BEGIN
+  NEW.updated_at := now();
+  RETURN NEW;
+END;
+$$;
+
+CREATE TRIGGER update_updated_at_trigger
+  BEFORE UPDATE ON public.my_table
+  FOR EACH ROW
+  EXECUTE FUNCTION public.update_updated_at();
+```
+
+### Error handling
+
+```sql
+CREATE OR REPLACE FUNCTION public.safe_divide(numerator numeric, denominator numeric)
+RETURNS numeric
+LANGUAGE plpgsql
+SECURITY INVOKER
+SET search_path = ''
+AS $$
+BEGIN
+  IF denominator = 0 THEN
+    RAISE EXCEPTION 'Division by zero is not allowed';
+  END IF;
+
+  RETURN numerator / denominator;
+END;
+$$;
+```
+
+### Immutable SQL function
+
+```sql
+CREATE OR REPLACE FUNCTION public.full_name(first_name text, last_name text)
+RETURNS text
+LANGUAGE sql
+SECURITY INVOKER
+SET search_path = ''
+IMMUTABLE
+AS $$
+  SELECT first_name || ' ' || last_name;
+$$;
+```
+
+## Chat App Functions
+
+### Room membership check (RLS helper)
+
+Use `SECURITY INVOKER` — relies on caller's RLS context. Avoids recursive policy subqueries when checking co-members.
+
+```sql
+CREATE OR REPLACE FUNCTION public.is_room_member(p_room_id uuid)
+RETURNS boolean
+LANGUAGE sql
+SECURITY INVOKER
+SET search_path = ''
+STABLE
+AS $$
+  SELECT EXISTS (
+    SELECT 1
+    FROM public.chat_room_member
+    WHERE chat_room_id = p_room_id
+      AND member_id = (SELECT auth.uid())
+  );
+$$;
+```
+
+### Create user profile on signup
+
+`SECURITY DEFINER` required to insert into `public.user_profile` before the user has a session row visible under RLS.
+
+```sql
+CREATE OR REPLACE FUNCTION public.handle_new_user()
+RETURNS trigger
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = ''
+AS $$
+BEGIN
+  INSERT INTO public.user_profile (id, name, image_url)
+  VALUES (
+    NEW.id,
+    COALESCE(NEW.raw_user_meta_data ->> 'full_name', NEW.raw_user_meta_data ->> 'name', 'Anonymous'),
+    NEW.raw_user_meta_data ->> 'avatar_url'
+  );
+  RETURN NEW;
+END;
+$$;
+
+CREATE TRIGGER on_auth_user_created
+  AFTER INSERT ON auth.users
+  FOR EACH ROW
+  EXECUTE FUNCTION public.handle_new_user();
+```
+
+### Message broadcast trigger (Realtime)
+
+`SECURITY DEFINER` required — `realtime.broadcast_changes` runs in the Realtime schema and must bypass caller RLS to publish.
+
+Topic pattern: `room:{chat_room_id}:messages`. Events match `TG_OP` (`INSERT`, `UPDATE`, `DELETE`).
+
+```sql
+CREATE OR REPLACE FUNCTION public.message_broadcast_trigger()
+RETURNS trigger
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = ''
+AS $$
+BEGIN
+  PERFORM realtime.broadcast_changes(
+    'room:' || COALESCE(NEW.chat_room_id, OLD.chat_room_id)::text || ':messages',
+    TG_OP,
+    TG_OP,
+    TG_TABLE_NAME,
+    TG_TABLE_SCHEMA,
+    NEW,
+    OLD
+  );
+  RETURN COALESCE(NEW, OLD);
+END;
+$$;
+
+CREATE TRIGGER message_broadcast_trigger
+  AFTER INSERT OR UPDATE OR DELETE ON public.message
+  FOR EACH ROW
+  EXECUTE FUNCTION public.message_broadcast_trigger();
+```
+
+### Custom broadcast payload (alternative)
+
+Use when you need a named event (`message_created`) instead of raw `TG_OP`:
+
+```sql
+CREATE OR REPLACE FUNCTION public.message_created_broadcast()
+RETURNS trigger
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = ''
+AS $$
+BEGIN
+  PERFORM realtime.send(
+    'room:' || NEW.chat_room_id::text || ':messages',
+    'message_created',
+    jsonb_build_object(
+      'id', NEW.id,
+      'text', NEW.text,
+      'author_id', NEW.author_id,
+      'chat_room_id', NEW.chat_room_id,
+      'created_at', NEW.created_at
+    ),
+    true
+  );
+  RETURN NEW;
+END;
+$$;
+
+CREATE TRIGGER message_created_broadcast
+  AFTER INSERT ON public.message
+  FOR EACH ROW
+  EXECUTE FUNCTION public.message_created_broadcast();
+```
+
+The fourth argument `true` marks the message as private (requires RLS on `realtime.messages`).
+
+## When to Use SECURITY DEFINER
+
+| Function | Invoker / Definer | Reason |
+| -------- | ----------------- | ------ |
+| `is_room_member` | Invoker | Respects caller auth context |
+| `handle_new_user` | Definer | Insert profile during auth signup |
+| `message_broadcast_trigger` | Definer | Publish via `realtime.broadcast_changes` |
+| `message_created_broadcast` | Definer | Publish via `realtime.send` |
+
+## Migrations
+
+- Pair function + trigger in the same migration file
+- Use `CREATE OR REPLACE FUNCTION` for idempotent updates
+- Drop triggers before replacing trigger functions when signature changes

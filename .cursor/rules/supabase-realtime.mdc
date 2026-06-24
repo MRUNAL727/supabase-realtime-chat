@@ -1,0 +1,165 @@
+---
+description: Supabase Realtime patterns — broadcast, private channels, triggers, RLS, and client cleanup
+globs: services/supabase/**,app/rooms/**,supabase/**,**/*.sql
+alwaysApply: false
+---
+
+# Supabase Realtime
+
+Expert guidance for Realtime in this chat app. Schema: `chat_room`, `chat_room_member`, `message`, `user_profile`.
+
+## Do
+
+- Use `broadcast` for all realtime events (DB triggers, messaging, notifications)
+- Use `presence` sparingly (online status, user counters)
+- Create indexes for all columns used in RLS policies
+- Topic pattern: `scope:entity:id` — e.g. `room:{chat_room_id}:messages`
+- Event names in snake_case: `message_created`, `user_joined`
+- Include unsubscribe/cleanup in all implementations
+- Set `private: true` for channels using DB triggers or RLS
+- Prefer private channels over public
+- Implement error handling and reconnection logic
+- Call `await supabase.realtime.setAuth()` before subscribing to private channels
+
+## Don't
+
+- Use `postgres_changes` for new code — migrate existing apps to `broadcast` via DB triggers
+- Create multiple subscriptions without cleanup
+- Write complex RLS without indexes
+- Use generic event names (`update`, `change`)
+- Subscribe directly in render without state management
+- Call `realtime.send` or `realtime.broadcast_changes` from client code
+
+## Function Selection
+
+| Use Case | Use |
+| -------- | --- |
+| Custom payloads / business logic | `broadcast` |
+| Database change notifications | `broadcast` via DB triggers |
+| High-frequency updates | `broadcast` with minimal payload |
+| User presence/status | `presence` (sparingly) |
+| Client-to-client messaging | `broadcast` (websockets only) |
+
+## Naming
+
+**Topics:** `room:123:messages`, `user:456:notifications`, `room:123:presence`
+
+**Events:** `message_created`, `user_joined`, `status_changed`
+
+## Client Setup (React)
+
+```typescript
+const channelRef = useRef<RealtimeChannel | null>(null)
+
+useEffect(() => {
+  if (channelRef.current?.state === 'subscribed') return
+
+  const supabase = createClient()
+  const channel = supabase.channel(`room:${roomId}:messages`, {
+    config: {
+      private: true,
+      broadcast: { self: true, ack: true },
+    },
+  })
+  channelRef.current = channel
+
+  void supabase.realtime.setAuth()
+
+  channel
+    .on('broadcast', { event: 'message_created' }, handleMessage)
+    .subscribe((status, err) => {
+      if (status === 'CHANNEL_ERROR') console.error('Channel error:', err)
+    })
+
+  return () => {
+    if (channelRef.current) {
+      void supabase.removeChannel(channelRef.current)
+      channelRef.current = null
+    }
+  }
+}, [roomId])
+```
+
+## Database Triggers
+
+Use `realtime.broadcast_changes` for table change notifications:
+
+```sql
+CREATE OR REPLACE FUNCTION message_broadcast_trigger()
+RETURNS TRIGGER AS $$
+BEGIN
+  PERFORM realtime.broadcast_changes(
+    'room:' || COALESCE(NEW.chat_room_id, OLD.chat_room_id)::text || ':messages',
+    TG_OP, TG_OP, TG_TABLE_NAME, TG_TABLE_SCHEMA, NEW, OLD
+  );
+  RETURN COALESCE(NEW, OLD);
+END;
+$$ LANGUAGE plpgsql SECURITY DEFINER;
+```
+
+Use `realtime.send` for custom payloads not bound to a table row:
+
+```sql
+PERFORM realtime.send(
+  'room:' || NEW.chat_room_id::text || ':messages',
+  'message_created',
+  jsonb_build_object('id', NEW.id, 'text', NEW.text),
+  false
+);
+```
+
+Broadcast only significant changes when needed:
+
+```sql
+IF TG_OP = 'UPDATE' AND OLD.text IS DISTINCT FROM NEW.text THEN
+  PERFORM realtime.broadcast_changes(...);
+END IF;
+```
+
+## Authorization (RLS on realtime.messages)
+
+```sql
+CREATE POLICY "room_members_can_read" ON realtime.messages
+FOR SELECT TO authenticated
+USING (
+  topic LIKE 'room:%:messages' AND
+  EXISTS (
+    SELECT 1 FROM chat_room_member
+    WHERE member_id = auth.uid()
+    AND chat_room_id = SPLIT_PART(topic, ':', 2)::uuid
+  )
+);
+
+CREATE INDEX idx_chat_room_member_member_room
+ON chat_room_member(member_id, chat_room_id);
+```
+
+Add matching INSERT policies when clients broadcast directly.
+
+Enable **private-only channels** in Dashboard → Project Settings → Realtime Settings for production.
+
+## Reconnection
+
+The client reconnects automatically with exponential backoff. Monitor status in `subscribe()` callback; no manual retry needed for `CHANNEL_ERROR`.
+
+```typescript
+createClient(url, key, {
+  realtime: { params: { log_level: 'info', reconnectAfterMs: 1000 } },
+})
+```
+
+## Migration from postgres_changes
+
+1. Replace client: `.on('broadcast', { event: 'INSERT' }, callback)` on `room:{id}:messages`
+2. Add DB trigger calling `realtime.broadcast_changes`
+3. Add RLS policies on `realtime.messages` with indexes
+
+## Code Generation Checklist
+
+- Favor `broadcast` over `postgres_changes`
+- Check `channel.state` before subscribing
+- Include cleanup via `removeChannel`
+- Use consistent topic/event naming
+- Set `private: true` for trigger-backed channels
+- Suggest indexes for RLS policy columns
+- Include reconnection handling for production
